@@ -1,35 +1,33 @@
-'''
+"""
 Template Component main class.
 
-'''
+"""
 
 import logging
 import sys
-from datetime import datetime
+import os
+import json
+#import time
+#from datetime import datetime
 
 from kbc.env_handler import KBCEnvHandler
-from kbc.result import KBCTableDef
-from kbc.result import ResultWriter
 
-from hs import hs_client, hs_result
-from hs.hs_client import HubspotClient
-from hs.hs_result import DealsWriter
+from confluent_kafka import Consumer, KafkaException, KafkaError
 
 # global constants
-SUPPORTED_ENDPOINTS = ['companies', 'deals']
 
 # configuration variables
-KEY_API_TOKEN = '#api_token'
-KEY_PERIOD_FROM = 'period_from'
-KEY_ENDPOINTS = 'endpoints'
+KBC_SERVERS = "servers"
+KBC_GROUP_ID = "group_id"
+KBC_USERNAME = "username"
+KBC_PASSWORD = "password"
+KBC_DURATION = "duration" # in seconds
+KBC_TOPIC = "topic"
+DEBUG = "debug"
 
-KEY_COMPANY_PROPERTIES = 'company_properties'
-KEY_DEAL_PROPERTIES = 'deal_properties'
+APP_VERSION = "0.0.1"
 
-MANDATORY_PARS = [KEY_ENDPOINTS, KEY_API_TOKEN]
-MANDATORY_IMAGE_PARS = []
-
-APP_VERSION = '0.0.1'
+MANDATORY_PARS = [KBC_SERVERS, KBC_GROUP_ID, KBC_TOPIC, KBC_USERNAME, KBC_PASSWORD, KBC_DURATION, DEBUG]
 
 
 class Component(KBCEnvHandler):
@@ -37,127 +35,167 @@ class Component(KBCEnvHandler):
     def __init__(self, debug=False):
         KBCEnvHandler.__init__(self, MANDATORY_PARS)
         # override debug from config
-        if self.cfg_params.get('debug'):
+        if self.cfg_params.get(DEBUG):
             debug = True
+                # Create output folder
+        
+        FOLDER_PATH = os.path.join(self.data_path, "/data/out/tables/")
+        if os.path.exists(FOLDER_PATH)==False:
+            os.makedirs(FOLDER_PATH)
+            logging.info("Created output folder: {0}".format(FOLDER_PATH))
+        else:
+            logging.info("Output folder: {0}".format(FOLDER_PATH))
 
-        self.set_default_logger('DEBUG' if debug else 'INFO')
-        logging.info('Running version %s', APP_VERSION)
-        logging.info('Loading configuration...')
+        self.set_default_logger("DEBUG" if debug else "INFO")
+        logging.info("Running version %s", APP_VERSION)
+        logging.info("Loading configuration...")
 
         try:
-            self.validate_config()
-            self.validate_image_parameters(MANDATORY_IMAGE_PARS)
+            self.validateConfig()
         except ValueError as e:
             logging.error(e)
             exit(1)
 
-        # intialize instance parameteres
-        token = self.cfg_params[KEY_API_TOKEN]
-        self.hs_client = HubspotClient(token)
 
     def run(self):
-        '''
+        """
         Main execution code
-        '''
+
+        TODO - statistics when DEBUG in conf dict:
+        stats_cb(json_str): Callback for statistics data. This callback is triggered by poll() or flush every statistics.interval.ms (needs to be configured separately). Function argument json_str is a str instance of a JSON document containing statistics data. This callback is served upon calling client.poll() or producer.flush(). See https://github.com/edenhill/librdkafka/wiki/Statistics” for more information.
+        """
+
         params = self.cfg_params  # noqa
 
-        if params.get(KEY_PERIOD_FROM):
-            start_date, end_date = self.get_date_period_converted(params.get(KEY_PERIOD_FROM),
-                                                                  datetime.utcnow().strftime('%Y-%m-%d'))
-            recent = True
+        # Generating a string out of the list
+        servers = ",".join(params.get(KBC_SERVERS))
+        
+
+        # Get current state file for offset, 0 if empty
+        try:
+            offset = self.get_state_file()["offset"]
+        except:
+            offset = 0
+
+        conf = {
+            "bootstrap.servers": servers,
+            "group.id": "%s-consumer" % params.get(KBC_GROUP_ID),
+            "session.timeout.ms": 6000,
+            "security.protocol": "SASL_SSL",
+	        "sasl.mechanisms": "SCRAM-SHA-256",
+            "sasl.username": params.get(KBC_USERNAME),
+            "sasl.password": params.get(KBC_PASSWORD),
+            "auto.offset.reset": "smallest"
+            }
+
+        if offset == 0:
+            logging.info("Extracting data from the beginninng")
         else:
-            start_date = None
-            recent = False
+            logging.info("Extracting data from previous offset: {0}".format(offset))
 
-        endpoints = params.get(KEY_ENDPOINTS, SUPPORTED_ENDPOINTS)
+        topics = (params.get(KBC_TOPIC)).split(",")
+        
+        # Get data
+        self.extract_data(conf, offset, topics, self.FOLDER_PATH)
 
-        if 'companies' in endpoints:
-            logging.info('Extracting Companies')
-            self.extract_companies(recent)
+        # TODO there should be a function to kill this based on the offset
+        logging.info("Extraction finished.")
 
-        if 'deals' in endpoints:
-            logging.info("Extracting deals")
-            self.extract_deals(start_date)
+        # Produce final sliced table
+        self.create_sliced_tables(self, "kafka")
 
-        logging.info("Extraction finished")
 
-    def extract_deals(self, start_time):
-        logging.info('Extracting Companies from HubSpot CRM')
-        fields = self._parse_props(self.cfg_params.get(KEY_DEAL_PROPERTIES))
-
-        if not fields:
-            expected_deal_cols = hs_client.DEAL_DEFAULT_COLS + self._build_property_cols(
-                hs_client.DEAL_DEFAULT_PROPERTIES)
-        else:
-            expected_deal_cols = hs_client.DEAL_DEFAULT_COLS + self._build_property_cols(fields)
-
-        deal_writer = DealsWriter(self.tables_out_path, expected_deal_cols)
-
-        self._get_n_process_results(self.hs_client.get_deals, deal_writer, start_time, fields)
-
-    def extract_companies(self, recent):
-        fields = self._parse_props(self.cfg_params.get(KEY_COMPANY_PROPERTIES))
-        if not fields:
-            expected_company_cols = hs_client.COMPANIES_DEFAULT_COLS + self._build_property_cols(
-                hs_client.COMPANY_DEFAULT_PROPERTIES)
-        else:
-            expected_company_cols = hs_client.COMPANIES_DEFAULT_COLS + self._build_property_cols(fields)
-        # table def
-        companies_table = KBCTableDef(name='companies', columns=expected_company_cols, pk=hs_result.COMPANY_PK)
-        # writer setup
-        comp_writer = ResultWriter(result_dir_path=self.tables_out_path, table_def=companies_table, fix_headers=True)
-        self._get_n_process_results(self.hs_client.get_companies, comp_writer, recent, fields)
-
-    def _parse_props(self, param):
+    def extract_data(self, conf, offset, topics, folder):
         """
-        Helper method to prepare dataset parameters query.
-
-        :param param:
-        :return:
+        Consumer configuration
+        https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md
         """
-        cols = []
-        if param:
-            cols = [p.strip() for p in param.split(",")]
-        return cols
+        
+        logging.info("Extracting data from topics {0}".format(topics))
 
-    def _get_n_process_results(self, ds_getter, writer, *fpars):
+        # Destination folder is the name of the topic
+        destination_folder = topics
+
+        # Setup
+        c = Consumer(**conf)
+
+    
+        # Subscribe to the topic
+        c.subscribe(topics)
+
+        logging.info("Subscribed to the topic ^")
+
+        # Data extraction
+        while True:
+            msg = c.poll(timeout=1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                logging.error("Consumer error: {}".format(msg.error()))
+                continue
+
+            extracted_data = (("{0}, {1}, {2}, {3}, {4}, {5}, {6}").format(
+                    msg.topic(),
+                    msg.timestamp()[0],
+                    msg.timestamp()[1],
+                    msg.partition(),
+                    msg.offset(),
+                    msg.key(),
+                    msg.value().decode('utf-8'),
+                    ))
+            filename = (("{0}/{1}-{2}-{3}.csv").format(
+                    folder,
+                    msg.topic(),
+                    msg.timestamp()[0],
+                    msg.timestamp()[1],
+                    ))
+
+            logging.info(extracted_data)
+            print(extracted_data)
+            # json.dumps(v).encode('utf-8')
+
+            # Save data as a sliced table file in defined folder
+            self.save_file(extracted_data, filename)
+
+        # Close down consumer to commit final offsets.
+        c.close()
+        
+        # will be changed
+        new_offset = msg.offset()
+
+        # Store previous offset
+        state_dict = {"offset": new_offset}
+        self.write_state_file(state_dict)
+
+
+    def save_file(self, line, filename):
         """
-               Generic method to get simple objects
-               :param ds_getter: dataset method to call
-               :param writer: result writer instance
-               :param *fpars: positional arguments for the ds_getter function.
-               :return:
-               """
-        with writer:
-            for res in ds_getter(*fpars):
-                if isinstance(res, list):
-                    writer.write_all(res)
-                else:
-                    writer.write(res)
+        Save text as file
+        """
 
-        # store manifest
-        logging.info("Storing manifest files.")
-        self.create_manifests(writer.collect_results())
+        #file_path = os.path.join(filename)
 
-    def _build_property_cols(self, properties):
-        # get flattened property cols
-        prop_cols = []
-        for p in properties:
-            prop_cols.append('properties.' + p + '.source')
-            prop_cols.append('properties.' + p + '.sourceId')
-            prop_cols.append('properties.' + p + '.timestamp')
-            prop_cols.append('properties.' + p + '.value')
-            prop_cols.append('properties.' + p + '.versions')
-        return prop_cols
+        print(filename)
+        logging.info(filename)
+
+        try:
+            with open(filename, 'w') as file:
+                file.write(line)
+                file.write('\n')
+            logging.info("File saved.")
+        except:
+            logging.error("Could not save file! exit.")
 
 
-"""
-        Main entrypoint
-"""
+
 if __name__ == "__main__":
+    """
+    Main entrypoint
+    """
     if len(sys.argv) > 1:
         debug = sys.argv[1]
     else:
         debug = True
+
     comp = Component(debug)
     comp.run()
