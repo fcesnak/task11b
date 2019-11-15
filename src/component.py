@@ -38,13 +38,6 @@ class Component(KBCEnvHandler):
         if self.cfg_params.get(DEBUG):
             debug = True
                 # Create output folder
-        
-        FOLDER_PATH = os.path.join(self.data_path, "/data/out/tables/")
-        if os.path.exists(FOLDER_PATH)==False:
-            os.makedirs(FOLDER_PATH)
-            logging.info("Created output folder: {0}".format(FOLDER_PATH))
-        else:
-            logging.info("Output folder: {0}".format(FOLDER_PATH))
 
         self.set_default_logger("DEBUG" if debug else "INFO")
         logging.info("Running version %s", APP_VERSION)
@@ -96,7 +89,7 @@ class Component(KBCEnvHandler):
         topics = (params.get(KBC_TOPIC)).split(",")
         
         # Get data
-        self.extract_data(conf, offset, topics, self.FOLDER_PATH)
+        self.extract_data(conf, offset, topics)
 
         # TODO there should be a function to kill this based on the offset
         logging.info("Extraction finished.")
@@ -105,7 +98,7 @@ class Component(KBCEnvHandler):
         self.create_sliced_tables(self, "kafka")
 
 
-    def extract_data(self, conf, offset, topics, folder):
+    def extract_data(self, conf, offset, topics):
         """
         Consumer configuration
         https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md
@@ -118,7 +111,6 @@ class Component(KBCEnvHandler):
 
         # Setup
         c = Consumer(**conf)
-
     
         # Subscribe to the topic
         c.subscribe(topics)
@@ -143,8 +135,8 @@ class Component(KBCEnvHandler):
                     msg.key(),
                     msg.value().decode('utf-8'),
                     ))
-            filename = (("{0}/{1}-{2}-{3}.csv").format(
-                    folder,
+            
+            filename = (("{0}-{1}-{2}.csv").format(
                     msg.topic(),
                     msg.timestamp()[0],
                     msg.timestamp()[1],
